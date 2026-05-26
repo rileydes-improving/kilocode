@@ -67,6 +67,7 @@ const PROVIDER_FIELDS: Record<EmbeddingProvider, ProviderFieldDef[]> = {
 const VECTOR_STORE_LABELS: Record<string, string> = {
   qdrant: "Qdrant (default)",
   lancedb: "LanceDB",
+  valkey: "Valkey",
 }
 
 function maskSecret(value: string | undefined): string {
@@ -283,9 +284,11 @@ function VectorStoreSelect(props: SubDialogProps) {
       options={options}
       current={indexing.vectorStore ?? "qdrant"}
       onSelect={async (option) => {
-        const store = option.value as "lancedb" | "qdrant"
+        const store = option.value as "lancedb" | "qdrant" | "valkey"
         if (store === "lancedb") {
           await showLancedbSettings(dialog, sync, sdk, toast, props.useSDK)
+        } else if (store === "valkey") {
+          await showValkeySettings(dialog, sync, sdk, toast, props.useSDK)
         } else {
           await showQdrantSettings(dialog, sync, sdk, toast, props.useSDK)
         }
@@ -353,6 +356,46 @@ async function showQdrantSettings(
     qdrant: {
       url: url.trim() || undefined,
       apiKey: apiKey.trim() || undefined,
+    },
+  }
+  await saveIndexing(sdk, sync, updated, toast)
+  dialog.replace(() => <DialogIndexing useSDK={useSDK} />)
+}
+
+async function showValkeySettings(
+  dialog: ReturnType<typeof useDialog>,
+  sync: ReturnType<typeof useSync>,
+  sdk: SDK,
+  toast: ReturnType<typeof useToast>,
+  useSDK: () => UseSDK,
+) {
+  const indexing = getIndexing(sync)
+  const currentSettings = indexing.valkey ?? {}
+
+  const url = await DialogPrompt.show(dialog, "Valkey — URL", {
+    value: currentSettings.url ?? "",
+    placeholder: "redis://localhost:6379",
+  })
+  if (url === null) {
+    dialog.replace(() => <DialogIndexing useSDK={useSDK} />)
+    return
+  }
+
+  const password = await DialogPrompt.show(dialog, "Valkey — Password", {
+    value: currentSettings.password ?? "",
+    placeholder: "Optional password",
+  })
+  if (password === null) {
+    dialog.replace(() => <DialogIndexing useSDK={useSDK} />)
+    return
+  }
+
+  const updated: IndexingConfig = {
+    ...getIndexing(sync),
+    vectorStore: "valkey",
+    valkey: {
+      url: url.trim() || undefined,
+      password: password.trim() || undefined,
     },
   }
   await saveIndexing(sdk, sync, updated, toast)
