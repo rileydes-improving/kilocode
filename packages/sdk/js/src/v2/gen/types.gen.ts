@@ -1025,7 +1025,7 @@ export type IndexingConfig = {
     | "voyage"
   model?: string
   dimension?: number
-  vectorStore?: "lancedb" | "qdrant"
+  vectorStore?: "lancedb" | "qdrant" | "valkey"
   kilo?: {
     apiKey?: string
     baseUrl?: string
@@ -1067,6 +1067,10 @@ export type IndexingConfig = {
   }
   lancedb?: {
     directory?: string
+  }
+valkey?: {
+    url?: string
+    password?: string
   }
   searchMinScore?: number
   searchMaxResults?: number
