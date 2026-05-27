@@ -15799,7 +15799,7 @@
             },
             "additionalProperties": false
           },
-"valkey": {
+          "valkey": {
             "type": "object",
             "properties": {
               "url": {
