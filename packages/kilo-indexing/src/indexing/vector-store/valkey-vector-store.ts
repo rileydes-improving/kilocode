@@ -1,19 +1,23 @@
 import { createHash } from "node:crypto"
-import { Batch, GlideClient, GlideFt, ClosingError, RequestError } from "@valkey/valkey-glide"
-import type { Field, FtCreateOptions, GlideString } from "@valkey/valkey-glide"
+import type { Field, FtCreateOptions, GlideClient, GlideString } from "@valkey/valkey-glide"
 import type { IVectorStore, VectorStoreSearchResult } from "../interfaces/vector-store"
 import type { PointStruct } from "../interfaces/vector-store"
 import type { EmbeddingProfile } from "../embedding-profile"
 import { DEFAULT_MAX_SEARCH_RESULTS, DEFAULT_SEARCH_MIN_SCORE } from "../constants"
 import { Log } from "../../util/log"
+// Not bundled: the CLI installs GLIDE on demand and points KILO_VALKEY_GLIDE_PATH at it.
+// Resolved per use (require is cached) so module mocks registered after first load still apply.
+import { loadGlide } from "./valkey-loader"
 
 const log = Log.create({ service: "valkey-store" })
 
+const SCHEMA = "1"
 const KEY = {
   complete: "indexing_complete",
   provider: "embedding_provider",
   model: "embedding_model_id",
   dimension: "embedding_dimension",
+  schema: "index_schema",
 }
 
 /**
@@ -49,14 +53,22 @@ export class ValkeyVectorStore implements IVectorStore {
   }
 
   /**
-   * Returns the Valkey URL with userinfo (credentials) stripped for safe logging.
+   * Parses the URL after dropping any userinfo. The password is configured separately, and an
+   * unescaped "/" in userinfo would otherwise make URL treat part of the password as the host.
+   */
+  private endpoint(): URL {
+    const scheme = this.valkeyUrl.startsWith("rediss://") ? "rediss://" : "redis://"
+    const rest = this.valkeyUrl.slice(scheme.length)
+    return new URL(scheme + rest.slice(rest.lastIndexOf("@") + 1))
+  }
+
+  /**
+   * Returns the Valkey URL reduced to scheme, host and port for safe logging.
    */
   private redactedUrl(): string {
     try {
-      const parsed = new URL(this.valkeyUrl)
-      parsed.username = ""
-      parsed.password = ""
-      return parsed.toString().replace(/\/$/, "")
+      const url = this.endpoint()
+      return `${url.protocol}//${url.host}`
     } catch {
       return "<invalid-url>"
     }
@@ -123,6 +135,18 @@ export class ValkeyVectorStore implements IVectorStore {
         return true
       }
 
+      const metadata = await this.getMetadata()
+      if (metadata?.[KEY.schema] !== SCHEMA) {
+        log.info("Index schema mismatch, recreating index", {
+          collection: this.collectionName,
+          stored: metadata?.[KEY.schema],
+          current: SCHEMA,
+        })
+        await this.dropIndex()
+        await this.createIndex()
+        return true
+      }
+
       return false
     } catch (error) {
       // Re-throw already-enriched connection errors from ensureConnected()
@@ -131,9 +155,7 @@ export class ValkeyVectorStore implements IVectorStore {
       }
       const msg = error instanceof Error ? error.message : String(error)
       log.error("Failed to initialize Valkey index", { collection: this.collectionName, error: msg })
-      throw new Error(
-        `Failed to initialize Valkey index "${this.collectionName}" at ${this.redactedUrl()}: ${msg}`,
-      )
+      throw new Error(`Failed to initialize Valkey index "${this.collectionName}" at ${this.redactedUrl()}: ${msg}`)
     }
   }
 
@@ -179,15 +201,12 @@ export class ValkeyVectorStore implements IVectorStore {
       [KEY.provider]: this.profile.provider,
       [KEY.model]: this.profile.modelId,
       [KEY.dimension]: String(this.profile.dimension),
+      [KEY.schema]: SCHEMA,
     }
     await client.hset(this.metadataKey, fields)
   }
 
   private async getMetadata(): Promise<Record<string, string> | null> {
-    return this.getMetadataHash()
-  }
-
-  private async getMetadataHash(): Promise<Record<string, string> | null> {
     const client = await this.ensureConnected()
     const hashData = await client.hgetall(this.metadataKey)
     if (!hashData || hashData.length === 0) {
@@ -201,7 +220,7 @@ export class ValkeyVectorStore implements IVectorStore {
   }
 
   private async getStoredProfile(): Promise<EmbeddingProfile | null> {
-    const metadata = await this.getMetadataHash()
+    const metadata = await this.getMetadata()
     if (!metadata) {
       return null
     }
@@ -237,7 +256,7 @@ export class ValkeyVectorStore implements IVectorStore {
     try {
       for (let i = 0; i < points.length; i += BATCH_CHUNK_SIZE) {
         const chunk = points.slice(i, i + BATCH_CHUNK_SIZE)
-        const batch = new Batch(false) // non-atomic pipeline
+        const batch = new (loadGlide().Batch)(false) // non-atomic pipeline
 
         for (const point of chunk) {
           const key = `${this.collectionName}:${point.id}`
@@ -292,7 +311,7 @@ export class ValkeyVectorStore implements IVectorStore {
       const vectorBlob = this.encodeVector(queryVector)
       const query = `${filter}=>[KNN ${actualMaxResults} @vector $BLOB AS score]`
 
-      const [_count, documents] = await GlideFt.search(client, this.collectionName, query, {
+      const [_count, documents] = await loadGlide().GlideFt.search(client, this.collectionName, query, {
         params: [{ key: "BLOB", value: vectorBlob }],
         returnFields: [
           { fieldIdentifier: "filePath" },
@@ -373,19 +392,26 @@ export class ValkeyVectorStore implements IVectorStore {
 
     try {
       const client = await this.ensureConnected()
-      const keysToDelete: string[] = []
       const DELETE_BATCH_SIZE = 1000
       const SEARCH_LIMIT = 10000
 
       for (const filePath of filePaths) {
+        // "=>" cannot be expressed in an FT.SEARCH TAG query; skip it so one path doesn't abort the batch
+        if (filePath.includes("=>")) {
+          log.warn("Skipping delete for path containing '=>'", { collection: this.collectionName, filePath })
+          continue
+        }
         const sanitizedPath = this.sanitizeTagValue(filePath)
         const query = `@filePath:{${sanitizedPath}}`
+
+        // Scope the pending keys to this path so one file's chunks are flushed before moving on.
+        const keysToDelete: string[] = []
 
         // Paginate: re-query from offset 0 until fewer than SEARCH_LIMIT remain,
         // ensuring files with more than 10,000 chunks are fully cleaned up.
         let found = 0
         do {
-          const [, documents] = await GlideFt.search(client, this.collectionName, query, {
+          const [, documents] = await loadGlide().GlideFt.search(client, this.collectionName, query, {
             limit: { offset: 0, count: SEARCH_LIMIT },
             nocontent: true,
           })
@@ -406,10 +432,10 @@ export class ValkeyVectorStore implements IVectorStore {
             await client.del(batch)
           }
         } while (found >= SEARCH_LIMIT)
-      }
 
-      if (keysToDelete.length > 0) {
-        await client.del(keysToDelete)
+        if (keysToDelete.length > 0) {
+          await client.del(keysToDelete)
+        }
       }
     } catch (error) {
       const samplePaths = filePaths.slice(0, 3)
@@ -449,13 +475,16 @@ export class ValkeyVectorStore implements IVectorStore {
         cursor = String(nextCursor)
 
         if (keys.length > 0) {
-          // Preserve the metadata key so hasIndexedData() still works after clear
+          // Preserve the metadata key so the profile and schema survive the clear
           const keysToDelete = (keys as string[]).filter((key) => key !== this.metadataKey)
           if (keysToDelete.length > 0) {
             await client.del(keysToDelete)
           }
         }
       } while (cursor !== "0")
+
+      // FT.INFO num_docs does not drop on DEL, so reset the flag hasIndexedData() relies on
+      await this.setMetadata(false)
     } catch (error) {
       log.error("Failed to clear collection", {
         collection: this.collectionName,
@@ -482,10 +511,10 @@ export class ValkeyVectorStore implements IVectorStore {
   async collectionExists(): Promise<boolean> {
     const client = await this.ensureConnected()
     try {
-      await GlideFt.info(client, this.collectionName)
+      await loadGlide().GlideFt.info(client, this.collectionName)
       return true
     } catch (error) {
-      if (error instanceof RequestError) {
+      if (error instanceof loadGlide().RequestError) {
         return false
       }
       throw error
@@ -570,6 +599,7 @@ export class ValkeyVectorStore implements IVectorStore {
     }
 
     const metadata = await this.getMetadata()
+    if (metadata?.[KEY.schema] !== SCHEMA) throw new Error("Baseline Valkey index schema does not match the worktree")
     if (!metadata || metadata[KEY.complete] !== "true") {
       throw new Error("Baseline Valkey index is not complete")
     }
@@ -607,12 +637,12 @@ export class ValkeyVectorStore implements IVectorStore {
   }
 
   private async createConnection(): Promise<GlideClient> {
-    const url = new URL(this.valkeyUrl)
+    const url = this.endpoint()
     const host = url.hostname
     const port = url.port ? parseInt(url.port, 10) : 6379
     const useTLS = url.protocol === "rediss:"
 
-    return GlideClient.createClient({
+    return loadGlide().GlideClient.createClient({
       addresses: [{ host, port }],
       useTLS,
       credentials: this.valkeyPassword ? { password: this.valkeyPassword } : undefined,
@@ -638,7 +668,7 @@ export class ValkeyVectorStore implements IVectorStore {
   }
 
   protected handleClientError(error: unknown): void {
-    if (error instanceof ClosingError) {
+    if (error instanceof loadGlide().ClosingError) {
       this.client = null
     }
   }
@@ -661,21 +691,15 @@ export class ValkeyVectorStore implements IVectorStore {
     }
 
     if (lower.includes("connection refused") || lower.includes("econnrefused")) {
-      return new Error(
-        `Connection refused for Valkey at ${url}. Ensure the Valkey server is running and accessible.`,
-      )
+      return new Error(`Connection refused for Valkey at ${url}. Ensure the Valkey server is running and accessible.`)
     }
 
     if (lower.includes("timeout") || lower.includes("etimedout")) {
-      return new Error(
-        `Connection timed out for Valkey at ${url}. Ensure the server is reachable and not overloaded.`,
-      )
+      return new Error(`Connection timed out for Valkey at ${url}. Ensure the server is reachable and not overloaded.`)
     }
 
     if (lower.includes("getaddrinfo") || lower.includes("enotfound")) {
-      return new Error(
-        `Cannot resolve host for Valkey at ${url}. Check that the hostname is correct.`,
-      )
+      return new Error(`Cannot resolve host for Valkey at ${url}. Check that the hostname is correct.`)
     }
 
     return new Error(`Connection to Valkey at ${url} failed: ${raw}`)
@@ -684,10 +708,10 @@ export class ValkeyVectorStore implements IVectorStore {
   async getIndexInfo(): Promise<Record<string, any> | null> {
     const client = await this.ensureConnected()
     try {
-      const info = await GlideFt.info(client, this.collectionName)
+      const info = await loadGlide().GlideFt.info(client, this.collectionName)
       return info as Record<string, any>
     } catch (error) {
-      if (error instanceof RequestError) {
+      if (error instanceof loadGlide().RequestError) {
         return null
       }
       throw error
@@ -728,7 +752,7 @@ export class ValkeyVectorStore implements IVectorStore {
       prefixes: [`${this.collectionName}:`],
     }
 
-    await GlideFt.create(client, this.collectionName, schema, options)
+    await loadGlide().GlideFt.create(client, this.collectionName, schema, options)
   }
 
   /**
@@ -743,7 +767,7 @@ export class ValkeyVectorStore implements IVectorStore {
     }
 
     const client = await this.ensureConnected()
-    await GlideFt.dropindex(client, this.collectionName)
+    await loadGlide().GlideFt.dropindex(client, this.collectionName)
     await this.scanAndDelete(`${this.collectionName}:`)
   }
 

@@ -1,7 +1,18 @@
-import { describe, test, expect } from "bun:test"
+import { describe, test, expect, mock } from "bun:test"
 import fc from "fast-check"
 import { createHash } from "crypto"
-import { ValkeyVectorStore } from "../../../../src/indexing/vector-store/valkey-vector-store"
+
+// These properties cover pure helpers only. Stub the client library so the module loads
+// on platforms where @valkey/valkey-glide has no native binding (Windows).
+mock.module("@valkey/valkey-glide", () => ({
+  GlideClient: {},
+  GlideFt: {},
+  Batch: class {},
+  RequestError: class extends Error {},
+  ClosingError: class extends Error {},
+}))
+
+const { ValkeyVectorStore } = await import("../../../../src/indexing/vector-store/valkey-vector-store")
 
 /**
  * Property-based tests for ValkeyVectorStore pure utility functions.
@@ -9,7 +20,7 @@ import { ValkeyVectorStore } from "../../../../src/indexing/vector-store/valkey-
 
 const PROPERTY_ITERATIONS = 100
 
-function createStore(): ValkeyVectorStore {
+function createStore() {
   return new ValkeyVectorStore("/dummy/workspace", "redis://localhost:6379", 128)
 }
 
@@ -243,173 +254,6 @@ describe("ValkeyVectorStore Property Tests", () => {
       expect(store.buildDirectoryFilter("./")).toBe("(@type:{point})")
     })
   })
-
-  describe("Score conversion and ordering", () => {
-    test("1 - distance produces scores in [0, 1] for distances in [0, 1]", () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }), {
-            minLength: 1,
-            maxLength: 50,
-          }),
-          (distances) => {
-            for (const d of distances) {
-              const score = 1 - d
-              expect(score).toBeGreaterThanOrEqual(0)
-              expect(score).toBeLessThanOrEqual(1)
-            }
-          },
-        ),
-        { numRuns: PROPERTY_ITERATIONS },
-      )
-    })
-
-    test("descending score order is equivalent to ascending distance order", () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }), {
-            minLength: 2,
-            maxLength: 50,
-          }),
-          (distances) => {
-            const scores = distances.map((d) => 1 - d)
-
-            const sortedByScoreDesc = [...scores].sort((a, b) => b - a)
-            const sortedByDistanceAsc = [...distances].sort((a, b) => a - b).map((d) => 1 - d)
-
-            expect(sortedByScoreDesc.length).toBe(sortedByDistanceAsc.length)
-            for (let i = 0; i < sortedByScoreDesc.length; i++) {
-              expect(sortedByScoreDesc[i]).toBe(sortedByDistanceAsc[i])
-            }
-          },
-        ),
-        { numRuns: PROPERTY_ITERATIONS },
-      )
-    })
-
-    test("if d1 < d2 then score1 > score2 (for distinguishable distances)", () => {
-      fc.assert(
-        fc.property(
-          fc.double({ min: 0, max: 0.99, noNaN: true, noDefaultInfinity: true }),
-          fc.double({ min: 1e-10, max: 1, noNaN: true, noDefaultInfinity: true }),
-          (d1, delta) => {
-            const d2 = Math.min(d1 + delta, 1)
-            fc.pre(1 - d1 !== 1 - d2)
-            const score1 = 1 - d1
-            const score2 = 1 - d2
-            expect(score1).toBeGreaterThan(score2)
-          },
-        ),
-        { numRuns: PROPERTY_ITERATIONS },
-      )
-    })
-  })
-
-  describe("minScore filtering excludes low scores", () => {
-    test("only results with score >= minScore are returned", () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }), {
-            minLength: 0,
-            maxLength: 50,
-          }),
-          fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }),
-          (scores, minScore) => {
-            const filtered = scores.filter((s) => s >= minScore)
-
-            for (const s of filtered) {
-              expect(s).toBeGreaterThanOrEqual(minScore)
-            }
-
-            const excluded = scores.filter((s) => s < minScore)
-            for (const s of excluded) {
-              expect(s).toBeLessThan(minScore)
-            }
-
-            expect(filtered.length).toBeLessThanOrEqual(scores.length)
-          },
-        ),
-        { numRuns: PROPERTY_ITERATIONS },
-      )
-    })
-
-    test("filtering preserves relative order of remaining results", () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }), {
-            minLength: 1,
-            maxLength: 50,
-          }),
-          fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }),
-          (scores, minScore) => {
-            const indexed = scores.map((s, i) => ({ score: s, index: i }))
-            const filtered = indexed.filter((item) => item.score >= minScore)
-
-            for (let i = 1; i < filtered.length; i++) {
-              expect(filtered[i].index).toBeGreaterThan(filtered[i - 1].index)
-            }
-          },
-        ),
-        { numRuns: PROPERTY_ITERATIONS },
-      )
-    })
-  })
-
-  describe("maxResults limits output size", () => {
-    test("returned array length <= maxResults", () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }), {
-            minLength: 0,
-            maxLength: 100,
-          }),
-          fc.integer({ min: 1, max: 100 }),
-          (results, maxResults) => {
-            const limited = results.slice(0, maxResults)
-            expect(limited.length).toBeLessThanOrEqual(maxResults)
-          },
-        ),
-        { numRuns: PROPERTY_ITERATIONS },
-      )
-    })
-
-    test("maxResults does not discard results when array is smaller", () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }), {
-            minLength: 0,
-            maxLength: 50,
-          }),
-          fc.integer({ min: 51, max: 200 }),
-          (results, maxResults) => {
-            const limited = results.slice(0, maxResults)
-            expect(limited.length).toBe(results.length)
-          },
-        ),
-        { numRuns: PROPERTY_ITERATIONS },
-      )
-    })
-
-    test("slicing preserves the first maxResults elements in order", () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }), {
-            minLength: 1,
-            maxLength: 100,
-          }),
-          fc.integer({ min: 1, max: 100 }),
-          (results, maxResults) => {
-            const limited = results.slice(0, maxResults)
-            for (let i = 0; i < limited.length; i++) {
-              expect(limited[i]).toBe(results[i])
-            }
-          },
-        ),
-        { numRuns: PROPERTY_ITERATIONS },
-      )
-    })
-  })
-
   describe("TAG value sanitization rejects injection vectors", () => {
     const store = createStore()
 

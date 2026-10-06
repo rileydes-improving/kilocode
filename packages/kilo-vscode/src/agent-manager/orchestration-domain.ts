@@ -1,6 +1,7 @@
 import * as fs from "fs"
 import type { KiloClient, SessionStatus } from "@kilocode/sdk/v2/client"
 import { sameDirectory } from "../kilo-provider-utils"
+import { isRunningStatus } from "../session-status"
 import type { LocalStats, WorktreeStats } from "./GitStatsPoller"
 import type { PRStatus } from "./types"
 import type { ManagedSession, Worktree, WorktreeStateManager } from "./WorktreeStateManager"
@@ -165,7 +166,7 @@ async function live(input: OverviewInput, sessions: ManagedSession[]) {
       ])
       if (status.error || perms.error || qs.error) unavailable.add(dir)
       for (const [id, value] of Object.entries(status.data ?? {}) as Array<[string, SessionStatus]>) {
-        statuses.set(id, value.type)
+        statuses.set(id, isRunningStatus(value.type) ? value.type : "idle")
       }
       for (const value of perms.data ?? []) permissions.add(value.sessionID)
       for (const value of qs.data ?? []) questions.add(value.sessionID)
@@ -317,6 +318,7 @@ interface Target {
   state: WorktreeStateManager
   sessionID: string
   managed?: ManagedSession
+  directory?: string
 }
 
 interface Located {
@@ -324,13 +326,15 @@ interface Located {
   name: string
 }
 
-// Verify the target is a live managed session of this workspace and return its authoritative
-// directory plus display name, so error messages can echo exact IDs back to the caller.
+// Verify the target session and return its authoritative directory plus display name, so error
+// messages can echo exact IDs back to the caller. Reply routes may provide a verified directory.
 async function locate(input: Target): Promise<Located> {
   const managed = input.state.getSession(input.sessionID) ?? input.managed
-  if (!managed || managed.id !== input.sessionID)
+  if (managed && managed.id !== input.sessionID)
     throw new OrchestrationError("unknown_session", "The session is not managed by this Agent Manager workspace")
-  const dir = directory(input.root, input.state, managed)
+  const dir = input.directory ?? (managed ? directory(input.root, input.state, managed) : undefined)
+  if (!managed && !input.directory)
+    throw new OrchestrationError("unknown_session", "The session is not managed by this Agent Manager workspace")
   if (
     !dir ||
     !(await fs.promises.access(dir).then(
@@ -355,7 +359,7 @@ function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`
 }
 
-async function blocked(input: Target, dir: string, name: string): Promise<string | undefined> {
+async function blocked(input: Target, dir: string, name: string, questions?: "dismiss"): Promise<string | undefined> {
   const [perms, qs] = await Promise.all([
     input.client.permission.list({ directory: dir }),
     input.client.question.list({ directory: dir }),
@@ -363,7 +367,7 @@ async function blocked(input: Target, dir: string, name: string): Promise<string
   if (perms.error || qs.error)
     throw new OrchestrationError("host_error", "The managed session blockers could not be read")
   const mine = (qs.data ?? []).filter((value) => value.sessionID === input.sessionID)
-  const first = mine[0]
+  const first = questions === "dismiss" ? undefined : mine.at(0)
   if (first) {
     const detail = mine
       .map((value) => {
@@ -392,21 +396,28 @@ export async function prompt(input: {
   state: WorktreeStateManager
   sessionID: string
   text: string
-  messageID: string
   signal?: AbortSignal
   managed?: ManagedSession
+  directory?: string
+  questions?: "dismiss"
+  model?: { providerID: string; modelID: string }
+  variant?: string
+  agent?: string
+  metadata?: Record<string, unknown>
 }): Promise<void> {
   if (input.signal?.aborted) return
   const target = await locate(input)
-  const blocker = await blocked(input, target.dir, target.name)
+  const blocker = await blocked(input, target.dir, target.name, input.questions)
   if (blocker) throw new OrchestrationError("unavailable_session", blocker)
   if (input.signal?.aborted) return
   await input.client.session.promptAsync(
     {
       sessionID: input.sessionID,
       directory: target.dir,
-      messageID: `msg_agent_manager_${input.messageID}`,
-      parts: [{ type: "text", text: input.text }],
+      parts: [{ type: "text", text: input.text, ...(input.metadata ? { metadata: input.metadata } : {}) }],
+      model: input.model,
+      variant: input.variant,
+      agent: input.agent,
       snapshotInitialization: SNAPSHOT_INITIALIZATION,
     },
     { throwOnError: true },

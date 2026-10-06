@@ -73,10 +73,11 @@ mock.module("@valkey/valkey-glide", () => ({
   SortOrder: { ASC: "ASC", DESC: "DESC" },
 }))
 
-// Import after mocking - only import the module under test, not @valkey/valkey-glide
-import { ValkeyVectorStore } from "../../../../src/indexing/vector-store/valkey-vector-store"
+// Dynamic import: a static one is hoisted above mock.module and would load the real
+// native binding, which does not exist on Windows.
+const { ValkeyVectorStore } = await import("../../../../src/indexing/vector-store/valkey-vector-store")
 
-function createStore(profile?: { provider: string; modelId: string; dimension: number }): ValkeyVectorStore {
+function createStore(profile?: { provider: string; modelId: string; dimension: number }) {
   return new ValkeyVectorStore("/test/workspace", "redis://localhost:6379", 128, undefined, profile as any)
 }
 
@@ -102,7 +103,7 @@ function resetMocks() {
   mockExec.mockResolvedValue([])
 }
 
-describe("ValkeyVectorStore - Lifecycle, Metadata, Error Handling, and Service Factory", () => {
+describe("ValkeyVectorStore - Lifecycle, Metadata, and Error Handling", () => {
   beforeEach(() => {
     resetMocks()
   })
@@ -129,6 +130,19 @@ describe("ValkeyVectorStore - Lifecycle, Metadata, Error Handling, and Service F
       expect(deletedKeys).toContain(pointKey1)
       expect(deletedKeys).toContain(pointKey2)
       expect(deletedKeys).not.toContain(metadataKey)
+    })
+
+    test("marks indexing incomplete so hasIndexedData() is false for the emptied index", async () => {
+      const store = createStore()
+      mockFtInfo.mockResolvedValue({ num_docs: 5 })
+      mockScan.mockResolvedValueOnce(["0", [`${store.getCollectionName()}:point1`]])
+
+      await store.clearCollection()
+
+      expect(mockHset).toHaveBeenCalledWith(
+        store.getMetadataKey(),
+        expect.objectContaining({ indexing_complete: "false" }),
+      )
     })
 
     test("returns silently when collection doesn't exist", async () => {
@@ -202,6 +216,7 @@ describe("ValkeyVectorStore - Lifecycle, Metadata, Error Handling, and Service F
       expect(fields["embedding_provider"]).toBe("openai")
       expect(fields["embedding_model_id"]).toBe("text-embedding-3-small")
       expect(fields["embedding_dimension"]).toBe("1536")
+      expect(fields["index_schema"]).toBe("1")
     })
   })
 
@@ -289,8 +304,8 @@ describe("ValkeyVectorStore - Lifecycle, Metadata, Error Handling, and Service F
     })
   })
 
-  describe("Error logging includes correct context", () => {
-    test("upsert error re-throws with correct error and exercises error path", async () => {
+  describe("Errors propagate to the caller", () => {
+    test("upsertPoints re-throws the pipeline error", async () => {
       const store = createStore()
 
       // Make exec throw an error
@@ -310,13 +325,12 @@ describe("ValkeyVectorStore - Lifecycle, Metadata, Error Handling, and Service F
         },
       ]
 
-      // Verify the error is re-thrown (confirms error handling path is exercised)
       const thrownError = await store.upsertPoints(points).catch((e) => e)
       expect(thrownError).toBe(upsertError)
       expect(thrownError.message).toBe("Pipeline execution failed")
     })
 
-    test("deletion error re-throws with correct error and exercises error path", async () => {
+    test("deletePointsByMultipleFilePaths re-throws the search error", async () => {
       const store = createStore()
 
       // collectionExists → true
@@ -328,13 +342,12 @@ describe("ValkeyVectorStore - Lifecycle, Metadata, Error Handling, and Service F
 
       const filePaths = ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"]
 
-      // Verify the error is re-thrown (confirms error handling path is exercised)
       const thrownError = await store.deletePointsByMultipleFilePaths(filePaths).catch((e) => e)
       expect(thrownError).toBe(deleteError)
       expect(thrownError.message).toBe("Search during delete failed")
     })
 
-    test("search error re-throws with correct error and exercises error path", async () => {
+    test("search re-throws the KNN error", async () => {
       const store = createStore()
 
       // collectionExists → true
@@ -344,7 +357,6 @@ describe("ValkeyVectorStore - Lifecycle, Metadata, Error Handling, and Service F
       const searchError = new Error("KNN search failed")
       mockFtSearch.mockRejectedValue(searchError)
 
-      // Verify the error is re-thrown (confirms error handling path is exercised)
       const thrownError = await store
         .search(
           Array.from({ length: 128 }, () => 0.5),
@@ -385,40 +397,6 @@ describe("ValkeyVectorStore - Lifecycle, Metadata, Error Handling, and Service F
 
       const result = await store.hasIndexedData()
       expect(result).toBe(false)
-    })
-  })
-
-  describe("Service factory", () => {
-    test("creates ValkeyVectorStore with correct params", async () => {
-      // We test the factory logic by verifying ValkeyVectorStore is constructed correctly
-      const store = new ValkeyVectorStore("/my/workspace", "redis://valkey.example.com:6380", 768, "secret-password", {
-        provider: "openai",
-        modelId: "text-embedding-3-small",
-        dimension: 768,
-      } as any)
-
-      expect(store.getValkeyUrl()).toBe("redis://valkey.example.com:6380")
-      expect(store.getVectorSize()).toBe(768)
-      expect(store.getProfile()).toEqual({
-        provider: "openai",
-        modelId: "text-embedding-3-small",
-        dimension: 768,
-      })
-      // Collection name is deterministic based on workspace path
-      expect(store.getCollectionName()).toMatch(/^ws-[a-f0-9]{16}$/)
-    })
-
-    test("service factory throws when valkeyUrl is missing", () => {
-      // This tests the factory's validation logic inline
-      // The factory does: if (!config.valkeyUrl) throw new Error("Valkey URL is required.")
-      const createVectorStoreWithMissingUrl = () => {
-        const config = { vectorStoreProvider: "valkey" as const, valkeyUrl: undefined }
-        if (!config.valkeyUrl) {
-          throw new Error("Valkey URL is required.")
-        }
-      }
-
-      expect(createVectorStoreWithMissingUrl).toThrow("Valkey URL is required.")
     })
   })
 

@@ -22,8 +22,10 @@ import pkg from "../package.json"
 // kilocode_change start
 import { stageBubblewrap } from "./kilocode/bubblewrap"
 import { LanceDBRuntime } from "../src/kilocode/lancedb"
+import { ValkeyRuntime } from "../src/kilocode/valkey"
 import { KiloSandboxWorker } from "./kilocode/kilo-sandbox-worker"
 import { KiloSandboxNetwork } from "./kilocode/kilo-sandbox-network"
+import * as KiloSbom from "./kilocode/sbom"
 // kilocode_change end
 
 const singleFlag = process.argv.includes("--single")
@@ -308,7 +310,7 @@ for (const item of targets) {
     plugins: [plugin],
     // kilocode_change start - skip sourcemaps for release builds (each .js.map adds ~50 MB per target → ~600 MB total)
     sourcemap: Script.release ? "none" : "external",
-    external: ["node-gyp", ...LanceDBRuntime.external],
+    external: ["node-gyp", ...LanceDBRuntime.external, ...ValkeyRuntime.external],
     // kilocode_change end
     format: "esm",
     minify: true,
@@ -469,7 +471,16 @@ if (Script.release) {
       // kilocode_change end
     }
   }
-  await $`gh release upload v${Script.version} ${archives} --clobber` // kilocode_change
+  // kilocode_change start - CRA evidence: describe the exact archives that were
+  // just produced, then publish the sidecars with them so the release asset and
+  // its SBOM always land together.
+  const evidence = await KiloSbom.evidence({
+    dir: path.resolve(dir, "dist"),
+    release: { version: Script.version, channel: Script.channel },
+    expected: targets.length,
+  })
+  await $`gh release upload v${Script.version} ${[...archives, ...evidence.files]} --clobber`
+  // kilocode_change end
 }
 
 export { binaries }

@@ -65,8 +65,9 @@ mock.module("@valkey/valkey-glide", () => ({
   SortOrder: { ASC: "ASC", DESC: "DESC" },
 }))
 
-// Now import the module under test
-import { ValkeyVectorStore } from "../../../../src/indexing/vector-store/valkey-vector-store"
+// Dynamic import: a static one is hoisted above mock.module and would load the real
+// native binding, which does not exist on Windows.
+const { ValkeyVectorStore } = await import("../../../../src/indexing/vector-store/valkey-vector-store")
 
 const TEST_WORKSPACE = "/test/workspace"
 const TEST_URL = "redis://localhost:6379"
@@ -84,7 +85,7 @@ const expectedHash = createHash("sha256").update(TEST_WORKSPACE).digest("hex")
 const expectedCollectionName = `ws-${expectedHash.substring(0, 16)}`
 const expectedMetadataKey = `${expectedCollectionName}:__metadata__`
 
-function createStore(profile?: typeof TEST_PROFILE): ValkeyVectorStore {
+function createStore(profile?: typeof TEST_PROFILE) {
   return new ValkeyVectorStore(TEST_WORKSPACE, TEST_URL, TEST_VECTOR_SIZE, TEST_PASSWORD, profile)
 }
 
@@ -154,16 +155,6 @@ describe("ValkeyVectorStore Unit Tests", () => {
       const store = new ValkeyVectorStore(TEST_WORKSPACE, "localhost:6379", TEST_VECTOR_SIZE)
       expect(store.getValkeyUrl()).toBe("redis://localhost:6379")
     })
-
-    test("preserves existing redis:// scheme", () => {
-      const store = new ValkeyVectorStore(TEST_WORKSPACE, "redis://myhost:6380", TEST_VECTOR_SIZE)
-      expect(store.getValkeyUrl()).toBe("redis://myhost:6380")
-    })
-
-    test("preserves existing rediss:// scheme", () => {
-      const store = new ValkeyVectorStore(TEST_WORKSPACE, "rediss://secure-host:6380", TEST_VECTOR_SIZE)
-      expect(store.getValkeyUrl()).toBe("rediss://secure-host:6380")
-    })
   })
 
   describe("initialize()", () => {
@@ -228,6 +219,7 @@ describe("ValkeyVectorStore Unit Tests", () => {
           { field: "embedding_provider", value: "openai" },
           { field: "embedding_model_id", value: "text-embedding-3-small" },
           { field: "embedding_dimension", value: "1536" },
+          { field: "index_schema", value: "1" },
         ]),
       )
 
@@ -236,6 +228,63 @@ describe("ValkeyVectorStore Unit Tests", () => {
       expect(result).toBe(false)
       expect(mockFtCreate).not.toHaveBeenCalled()
       expect(mockFtDropindex).not.toHaveBeenCalled()
+    })
+
+    test("drops and recreates index when stored schema version differs", async () => {
+      const store = createStore(TEST_PROFILE)
+
+      let infoCallCount = 0
+      mockFtInfo.mockImplementation(() => {
+        infoCallCount++
+        if (infoCallCount <= 2) {
+          return Promise.resolve({
+            fields: [{ type: "VECTOR", vector_params: { dimension: TEST_VECTOR_SIZE } }],
+            num_docs: 5,
+          })
+        }
+        throw new MockRequestError("Unknown index name")
+      })
+
+      // Matching profile but no schema marker (pre-versioning layout)
+      mockHgetall.mockImplementation(() =>
+        Promise.resolve([
+          { field: "type", value: "metadata" },
+          { field: "indexing_complete", value: "true" },
+          { field: "embedding_provider", value: "openai" },
+          { field: "embedding_model_id", value: "text-embedding-3-small" },
+          { field: "embedding_dimension", value: "1536" },
+        ]),
+      )
+      mockScan.mockImplementation(() => Promise.resolve(["0", []]))
+
+      const result = await store.initialize()
+
+      expect(result).toBe(true)
+      expect(mockFtDropindex).toHaveBeenCalledTimes(1)
+      expect(mockFtCreate).toHaveBeenCalledTimes(1)
+    })
+
+    test("openExisting rejects a baseline with a different schema version", async () => {
+      const store = createStore(TEST_PROFILE)
+
+      mockFtInfo.mockImplementation(() =>
+        Promise.resolve({
+          fields: [{ type: "VECTOR", vector_params: { dimension: TEST_VECTOR_SIZE } }],
+          num_docs: 5,
+        }),
+      )
+      mockHgetall.mockImplementation(() =>
+        Promise.resolve([
+          { field: "type", value: "metadata" },
+          { field: "indexing_complete", value: "true" },
+          { field: "embedding_provider", value: "openai" },
+          { field: "embedding_model_id", value: "text-embedding-3-small" },
+          { field: "embedding_dimension", value: "1536" },
+          { field: "index_schema", value: "0" },
+        ]),
+      )
+
+      await expect(store.openExisting()).rejects.toThrow("Baseline Valkey index schema does not match the worktree")
     })
 
     test("drops and recreates index when stored profile has no metadata (legacy collection)", async () => {
@@ -631,6 +680,34 @@ describe("ValkeyVectorStore Unit Tests", () => {
       )
 
       await expect(store.initialize()).rejects.toThrow("Connection refused")
+    })
+  })
+
+  describe("URLs carrying credentials", () => {
+    const refuse = () =>
+      mockCreateClient.mockImplementation(() => Promise.reject(new Error("Connection refused: ECONNREFUSED")))
+
+    test.each([
+      ["redis://default:hunter2@cache.internal:6380", "redis://cache.internal:6380", "hunter2"],
+      ["redis://default:P@ss/w0rd@cache.internal:6380", "redis://cache.internal:6380", "w0rd"],
+    ])("%s is reported as %s without leaking the password", async (url, safe, secret) => {
+      refuse()
+      const store = new ValkeyVectorStore(TEST_WORKSPACE, url, TEST_VECTOR_SIZE)
+      const err = await store.initialize().catch((e: Error) => e)
+      expect(err).toBeInstanceOf(Error)
+      expect((err as Error).message).toContain(`Valkey at ${safe}.`)
+      expect((err as Error).message).not.toContain(secret)
+    })
+
+    test("connects to the host after the last @, not a fragment of the password", async () => {
+      const store = new ValkeyVectorStore(
+        TEST_WORKSPACE,
+        "rediss://default:P@ss/w0rd@cache.internal:6380",
+        TEST_VECTOR_SIZE,
+      )
+      await store.collectionExists()
+      const opts = (mockCreateClient.mock.calls.at(0) as unknown[] | undefined)?.at(0)
+      expect(opts).toMatchObject({ addresses: [{ host: "cache.internal", port: 6380 }], useTLS: true })
     })
   })
 

@@ -25,6 +25,7 @@ import { Event as IndexingEvent, Warning as IndexingWarningEvent } from "./index
 import { indexingWarningKey, type IndexingWarning } from "./indexing-warning"
 import { IndexingWorker } from "./indexing-worker-client"
 import { LanceDBRuntime } from "./lancedb"
+import { ValkeyRuntime } from "./valkey"
 import { indexingWithKiloDefault, resolveKiloIndexingAuth, type KiloIndexingAuth } from "./indexing-auth"
 import { primaryWorktree } from "./primary-worktree"
 
@@ -432,7 +433,10 @@ export namespace KiloIndexing {
       return base
     }
 
-    const err = await LanceDBRuntime.ensure(cfgInput.vectorStoreProvider)
+    const err = await Promise.all([
+      LanceDBRuntime.ensure(cfgInput.vectorStoreProvider),
+      ValkeyRuntime.ensure(cfgInput.vectorStoreProvider),
+    ])
       .then(async () => {
         if (hit.disposed) return
         const engine = IndexingWorker.create(dir, root, { status, telemetry, warning, log: output, failure })
@@ -532,6 +536,13 @@ export namespace KiloIndexing {
       hit.disposed = true
       await hit.entry?.dispose()
     }
+  }
+
+  /** True when VS Code has supplied consent for the project of the directory. */
+  export async function consented(dir: string) {
+    const project = projects.get(dir) ?? (await AppRuntime.runPromise(primaryWorktree(dir))) ?? dir
+    projects.set(dir, project)
+    return consent.get(project) === true
   }
 
   export async function current(): Promise<Status> {
